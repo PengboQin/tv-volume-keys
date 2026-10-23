@@ -1,0 +1,14 @@
+.build/
+dist/
+.DS_Store
+__pycache__/
+*.pyc
+*.xcuserstate
+xcuserdata/
+# Local handoff and household workflow notes are not public source.
+/AGENTS.md
+/当前任务.md
+/docs/本轮交付.md
+/docs/项目体积管理.md
+
+/docs/GitHub发布交接.json
