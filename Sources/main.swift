@@ -1,154 +1,6 @@
 import AppKit
 import ApplicationServices
-import CoreAudio
-import IOKit
 import ServiceManagement
-
-// TV Volume Keys. AUX CEC layout cross-checked with MacTV (MIT); see THIRD_PARTY_NOTICES.
-// No display-mode, audio-route, network, input-source, or power operations.
-enum VolumeAction: String {
-    case up, down, mute
-    var cec: UInt8 { self == .up ? 0x41 : self == .down ? 0x42 : 0x43 }
-    static func decode(subtype: Int, data: Int) -> (VolumeAction, Bool)? {
-        guard subtype == 8 else { return nil }
-        let key = (data >> 16) & 0xffff, state = (data >> 8) & 0xff
-        guard state == 0x0a || state == 0x0b else { return nil }
-        let action: VolumeAction
-        switch key { case 0: action = .up; case 1: action = .down; case 7: action = .mute; default: return nil }
-        return (action, state == 0x0a)
-    }
-}
-
-enum Failure: LocalizedError {
-    case message(String)
-    var errorDescription: String? { if case let .message(s) = self { return s }; return nil }
-}
-
-func externalDisplayCount() -> Int {
-    var count: UInt32 = 0
-    guard CGGetOnlineDisplayList(0, nil, &count) == .success, count > 0, count <= 32 else { return -1 }
-    var displays = [CGDirectDisplayID](repeating: 0, count: Int(count))
-    guard CGGetOnlineDisplayList(count, &displays, &count) == .success else { return -1 }
-    return displays.prefix(Int(count)).filter { CGDisplayIsBuiltin($0) == 0 }.count
-}
-
-func tr(_ english: String, _ chinese: String) -> String {
-    Locale.preferredLanguages.first?.hasPrefix("zh") == true ? chinese : english
-}
-
-func defaultOutputIsTV() -> Bool {
-    // First preview supports one external screen; refuse ambiguous routing.
-    guard externalDisplayCount() == 1 else { return false }
-    var a = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultOutputDevice,
-                                      mScope: kAudioObjectPropertyScopeGlobal, mElement: 0)
-    var device = AudioDeviceID(0), size = UInt32(MemoryLayout<AudioDeviceID>.size)
-    guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &a, 0, nil, &size, &device) == noErr else { return false }
-    var transport: UInt32 = 0
-    a.mSelector = kAudioDevicePropertyTransportType
-    size = UInt32(MemoryLayout<UInt32>.size)
-    guard AudioObjectGetPropertyData(device, &a, 0, nil, &size, &transport) == noErr,
-          transport == kAudioDeviceTransportTypeHDMI else { return false }
-    a.mSelector = kAudioObjectPropertyName
-    var name: Unmanaged<CFString>?
-    size = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
-    guard AudioObjectGetPropertyData(device, &a, 0, nil, &size, &name) == noErr,
-          let name else { return false }
-    _ = name.takeRetainedValue()
-    return true
-}
-
-final class CEC {
-    typealias Create = @convention(c) (CFAllocator?, io_service_t) -> UnsafeMutableRawPointer?
-    typealias Read = @convention(c) (UnsafeMutableRawPointer, UInt32, UnsafeMutableRawPointer, UInt32) -> Int32
-    typealias Write = @convention(c) (UnsafeMutableRawPointer, UInt32, UnsafeRawPointer, UInt32) -> Int32
-    static let library = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_LAZY)
-    let device: UnsafeMutableRawPointer
-    let get: Read
-    let put: Write
-    let source: UInt8
-    init() throws {
-        guard let library = Self.library,
-              let cp = dlsym(library, "IODPDeviceCreateWithService"),
-              let rp = dlsym(library, "IODPDeviceReadDPCD"),
-              let wp = dlsym(library, "IODPDeviceWriteDPCD") else { throw Failure.message(tr("CEC is unavailable on this system", "系统 CEC 接口不可用")) }
-        let create = unsafeBitCast(cp, to: Create.self)
-        get = unsafeBitCast(rp, to: Read.self)
-        put = unsafeBitCast(wp, to: Write.self)
-        var iterator: io_iterator_t = 0
-        guard IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching("DCPDPDeviceProxy"), &iterator) == 0 else { throw Failure.message(tr("Unable to inspect HDMI", "无法读取 HDMI 连接")) }
-        defer { IOObjectRelease(iterator) }
-        var matches: [UnsafeMutableRawPointer] = []
-        while case let service = IOIteratorNext(iterator), service != 0 {
-            defer { IOObjectRelease(service) }
-            guard let d = create(kCFAllocatorDefault, service) else { continue }
-            var cap: UInt8 = 0
-            if get(d, 0x3000, &cap, 1) == 0 && cap & 1 != 0 { matches.append(d) }
-            else { Unmanaged<AnyObject>.fromOpaque(d).release() }
-        }
-        guard matches.count == 1 else {
-            matches.forEach { Unmanaged<AnyObject>.fromOpaque($0).release() }
-            throw Failure.message(tr("One compatible CEC connection is required", "需要唯一的 HDMI-CEC 连接"))
-        }
-        let d = matches[0]
-        var control: UInt8 = 0, mask: UInt16 = 0
-        guard get(d, 0x3001, &control, 1) == 0 && control & 1 != 0,
-              get(d, 0x300e, &mask, 2) == 0,
-              let address = [4, 8, 11].first(where: { mask & (1 << $0) != 0 }) else {
-            Unmanaged<AnyObject>.fromOpaque(d).release()
-            throw Failure.message(tr("Enable CEC on the TV and check the HDMI connection", "CEC 未启用或 Mac 尚无播放地址"))
-        }
-        device = d; source = UInt8(address)
-    }
-    deinit { Unmanaged<AnyObject>.fromOpaque(device).release() }
-    func byte(_ address: UInt32) throws -> UInt8 {
-        guard [UInt32(0x3003), 0x3004].contains(address) else { throw Failure.message(tr("Unsupported register read", "不允许的读取")) }
-        var b: UInt8 = 0
-        guard get(device, address, &b, 1) == 0 else { throw Failure.message(tr("CEC read failed", "CEC 读取失败")) }
-        return b
-    }
-    func write(_ address: UInt32, _ data: [UInt8]) throws {
-        guard ((address == 0x3003 || address == 0x3004) && data.count == 1) ||
-                (address == 0x3020 && (2...3).contains(data.count)) else { throw Failure.message(tr("Unsupported register write", "不允许的写入")) }
-        let result = data.withUnsafeBytes { put(device, address, $0.baseAddress!, UInt32(data.count)) }
-        guard result == 0 else { throw Failure.message(tr("CEC write failed", "CEC 写入失败")) }
-    }
-    func send(_ payload: [UInt8]) throws {
-        guard [[UInt8(0x44), 0x41], [0x44, 0x42], [0x44, 0x43], [0x45]].contains(payload) else { throw Failure.message(tr("Only volume commands are allowed", "只允许音量操作")) }
-        let frame = [source << 4] + payload
-        let deadline = Date().addingTimeInterval(1)
-        while try byte(0x3003) & 0x80 != 0 {
-            guard Date() < deadline else { throw Failure.message(tr("CEC is busy; command not sent", "CEC 正忙，本次未发送")) }
-            Thread.sleep(forTimeInterval: 0.005)
-        }
-        try write(0x3004, [0xf0])
-        try write(0x3020, frame)
-        let descriptor = UInt8(frame.count - 1)
-        try write(0x3003, [descriptor | 0x90])
-        let end = Date().addingTimeInterval(1.5)
-        while Date() < end {
-            let flags = try byte(0x3004)
-            if flags & 0xe0 != 0 {
-                try write(0x3004, [flags & 0xf0])
-                throw Failure.message(tr("TV did not confirm the volume command", "电视未确认音量指令"))
-            }
-            if flags & 0x10 != 0 { try write(0x3004, [0x10]); return }
-            if try byte(0x3003) == descriptor | 0x10 { return }
-            Thread.sleep(forTimeInterval: 0.001)
-        }
-        throw Failure.message(tr("CEC timed out; no automatic retry", "CEC 超时，本次不自动重发"))
-    }
-    func press(_ action: VolumeAction) throws {
-        do { try send([0x44, action.cec]) }
-        catch { try? send([0x45]); throw error }
-        Thread.sleep(forTimeInterval: 0.06)
-        do { try send([0x45]) }
-        catch { try? send([0x45]); throw error } // Release-only retry cannot raise volume.
-    }
-}
-
-func shouldCaptureVolume(enabled: Bool, cec: Bool, hdmi: Bool, modifiers: CGEventFlags) -> Bool {
-    enabled && cec && hdmi && modifiers.intersection([.maskAlternate, .maskCommand, .maskControl]).isEmpty
-}
 
 let callback: CGEventTapCallBack = { _, type, event, pointer in
     guard let pointer else { return Unmanaged.passUnretained(event) }
@@ -165,7 +17,7 @@ let callback: CGEventTapCallBack = { _, type, event, pointer in
     if !down {
         return app.heldKeys.remove(action) != nil ? nil : Unmanaged.passUnretained(event)
     }
-    guard shouldCaptureVolume(enabled: app.enabled, cec: app.cecReady,
+    guard shouldCaptureVolume(enabled: app.enabled, cec: app.transportReady,
                               hdmi: defaultOutputIsTV(), modifiers: event.flags) else {
         return Unmanaged.passUnretained(event)
     }
@@ -182,16 +34,24 @@ final class VolumeKeys: NSObject, NSApplicationDelegate {
     var stateItem: NSMenuItem!
     var permissionItem: NSMenuItem!
     var toggleItem: NSMenuItem!
+    var cecItem: NSMenuItem!
+    var adbItem: NSMenuItem!
     var actionItems: [NSMenuItem] = []
-    let queue = DispatchQueue(label: "local.tv-volume-keys.cec", qos: .userInitiated)
+    let queue = DispatchQueue(label: "local.tv-volume-keys.transport", qos: .userInitiated)
     var timer: Timer?
     var heldKeys = Set<VolumeAction>()
     var enabled = true
-    var cecReady = false
+    var transportReady = false
+    var mode = ControlTransport(rawValue: UserDefaults.standard.string(forKey: "controlTransport") ?? "cec") ?? .cec
+    var adbConfiguration = ADBConfiguration.load()
+    var probing = false
+    var lastProbe = Date.distantPast
+    var connectionRevision = 0
     var connectionError = ""
     var busy = false
     var lastAccepted = Date.distantPast
     var keyCount = 0, commandCount = 0
+    var cecCount = 0, adbCount = 0
     var lastAction = "", lastError = ""
     var lastSaved = Data()
     let statusURL = FileManager.default.homeDirectoryForCurrentUser
@@ -223,6 +83,13 @@ final class VolumeKeys: NSObject, NSApplicationDelegate {
             entry.target = self; actionItems.append(entry); menu.addItem(entry)
         }
         menu.addItem(.separator())
+        cecItem = NSMenuItem(title: tr("HDMI-CEC (Default)", "HDMI-CEC（默认）"), action: #selector(selectCEC), keyEquivalent: "")
+        cecItem.target = self; menu.addItem(cecItem)
+        adbItem = NSMenuItem(title: tr("ADB Compatibility Mode", "ADB 兼容模式"), action: #selector(selectADB), keyEquivalent: "")
+        adbItem.target = self; menu.addItem(adbItem)
+        let configure = NSMenuItem(title: tr("Configure ADB Connection…", "配置 ADB 连接…"), action: #selector(configureADB), keyEquivalent: "")
+        configure.target = self; menu.addItem(configure)
+        menu.addItem(.separator())
         toggleItem = NSMenuItem(title: tr("Use Keyboard Volume Keys", "使用键盘音量键"), action: #selector(toggle), keyEquivalent: "")
         toggleItem.target = self; menu.addItem(toggleItem)
         let login = NSMenuItem(title: tr("Open at Login", "登录时启动"), action: #selector(toggleLogin), keyEquivalent: "")
@@ -238,11 +105,28 @@ final class VolumeKeys: NSObject, NSApplicationDelegate {
         timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in self?.refresh() }
     }
     func refresh() {
-        cecReady = false
-        connectionError = ""
-        if defaultOutputIsTV() {
-            do { _ = try CEC(); cecReady = true }
-            catch { connectionError = error.localizedDescription }
+        if mode == .cec {
+            transportReady = false; connectionError = ""
+            if defaultOutputIsTV() {
+                do { _ = try CEC(); transportReady = true }
+                catch { connectionError = error.localizedDescription }
+            }
+        } else if adbConfiguration == nil {
+            transportReady = false; connectionError = tr("Configure the ADB connection", "请先配置 ADB 连接")
+        } else if defaultOutputIsTV(), !probing, !busy, Date().timeIntervalSince(lastProbe) >= 8 {
+            probing = true; lastProbe = Date()
+            let revision = connectionRevision, config = adbConfiguration!
+            if !transportReady { connectionError = tr("Checking ADB connection…", "正在检查 ADB 连接…") }
+            queue.async { [weak self] in
+                var probeError = ""
+                do { try ADBTransport(config).probe() } catch { probeError = error.localizedDescription }
+                DispatchQueue.main.async {
+                    guard let self, self.connectionRevision == revision else { return }
+                    self.probing = false; self.transportReady = probeError.isEmpty; self.connectionError = probeError
+                    if probeError.isEmpty { self.lastError = "" }
+                    self.refresh()
+                }
+            }
         }
         if !AXIsProcessTrusted(), let old = tap {
             CGEvent.tapEnable(tap: old, enable: false)
@@ -251,16 +135,19 @@ final class VolumeKeys: NSObject, NSApplicationDelegate {
             source = nil
         }
         if enabled && AXIsProcessTrusted() && tap == nil { installTap() }
-        let active = tap != nil && AXIsProcessTrusted() && enabled && cecReady && defaultOutputIsTV()
-        stateItem.title = !defaultOutputIsTV() ? tr("Select one HDMI display for sound", "请选择单个 HDMI 屏幕输出声音") : !cecReady ? connectionError : !enabled ? tr("Keyboard control is paused", "键盘控制已暂停") : !AXIsProcessTrusted() ? tr("Allow keyboard access", "等待键盘权限") : !defaultOutputIsTV() ? tr("Select the HDMI sound output", "声音输出未选择电视") : tap == nil ? tr("Keyboard access is not ready", "键盘连接未就绪") : lastError.isEmpty ? tr("Keyboard controls the TV", "键盘已连接电视") : lastError
+        let active = tap != nil && AXIsProcessTrusted() && enabled && transportReady && defaultOutputIsTV()
+        stateItem.title = !defaultOutputIsTV() ? tr("Select one HDMI display for sound", "请选择单个 HDMI 屏幕输出声音") : !transportReady ? connectionError : !enabled ? tr("Keyboard control is paused", "键盘控制已暂停") : !AXIsProcessTrusted() ? tr("Allow keyboard access", "等待键盘权限") : tap == nil ? tr("Keyboard access is not ready", "键盘连接未就绪") : lastError.isEmpty ? (mode == .adb ? tr("Keyboard controls the TV via ADB", "键盘已通过 ADB 连接电视") : tr("Keyboard controls the TV via CEC", "键盘已通过 CEC 连接电视")) : lastError
         item.button?.toolTip = tr("TV Volume Keys · ", "电视音量键 · ") + stateItem.title
         permissionItem.isHidden = AXIsProcessTrusted() && tap != nil
         toggleItem.state = enabled ? .on : .off
-        for entry in actionItems { entry.isEnabled = defaultOutputIsTV() && cecReady }
+        cecItem.state = mode == .cec ? .on : .off; adbItem.state = mode == .adb ? .on : .off
+        for entry in actionItems { entry.isEnabled = defaultOutputIsTV() && transportReady }
         var state: [String: Any] = ["accessibilityGranted": AXIsProcessTrusted(),
             "eventTapInstalled": tap != nil, "enabled": enabled, "activeForTV": active,
-            "defaultOutputIsTV": defaultOutputIsTV(), "cecAvailable": cecReady, "keyPressesObserved": keyCount,
-            "cecCommandsCompleted": commandCount, "lastAction": lastAction, "lastError": lastError]
+            "defaultOutputIsTV": defaultOutputIsTV(), "transport": mode.rawValue, "transportReady": transportReady,
+            "cecAvailable": mode == .cec && transportReady, "keyPressesObserved": keyCount,
+            "volumeCommandsCompleted": commandCount, "cecCommandsCompleted": cecCount, "adbCommandsCompleted": adbCount,
+            "version": AppVersion.full, "lastAction": lastAction, "lastError": lastError]
         if let stable = try? JSONSerialization.data(withJSONObject: state, options: [.sortedKeys]), stable != lastSaved {
             lastSaved = stable; state["updatedAt"] = ISO8601DateFormatter().string(from: Date())
             try? FileManager.default.createDirectory(at: statusURL.deletingLastPathComponent(), withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
@@ -283,21 +170,31 @@ final class VolumeKeys: NSObject, NSApplicationDelegate {
         lastError = ""
     }
     func handle(_ action: VolumeAction, fromKey: Bool = false) {
-        guard defaultOutputIsTV() else { return }
+        guard defaultOutputIsTV(), transportReady else { return }
         if fromKey { keyCount += 1 }
         // Drop pending repeats instead of accumulating volume changes after release.
-        guard !busy && Date().timeIntervalSince(lastAccepted) >= 0.10 else { return }
+        guard !busy, !probing, Date().timeIntervalSince(lastAccepted) >= 0.10 else { return }
         busy = true; lastAccepted = Date()
+        let selectedMode = mode, config = adbConfiguration, revision = connectionRevision
         queue.async { [weak self] in
             var failure = ""
             do {
                 guard defaultOutputIsTV() else { throw Failure.message(tr("Audio output changed; command skipped", "声音输出已切换，已跳过")) }
-                try CEC().press(action)
+                if selectedMode == .cec { try CEC().press(action) }
+                else if let config { try ADBTransport(config).press(action) }
+                else { throw Failure.message(tr("Configure the ADB connection", "请先配置 ADB 连接")) }
             } catch { failure = error.localizedDescription }
             DispatchQueue.main.async {
                 guard let self else { return }
-                self.busy = false; self.lastError = failure
-                if failure.isEmpty { self.commandCount += 1; self.lastAction = action.rawValue }
+                self.busy = false
+                guard self.connectionRevision == revision else { self.refresh(); return }
+                self.lastError = failure
+                if failure.isEmpty {
+                    self.commandCount += 1; self.lastAction = action.rawValue
+                    if selectedMode == .adb { self.adbCount += 1 } else { self.cecCount += 1 }
+                } else if selectedMode == .adb {
+                    self.transportReady = false; self.connectionError = failure; self.lastProbe = .distantPast
+                }
                 self.refresh()
             }
         }
@@ -323,8 +220,8 @@ final class VolumeKeys: NSObject, NSApplicationDelegate {
     }
     @objc func about() {
         let alert = NSAlert()
-        alert.messageText = "TV Volume Keys · 0.1.0 preview"
-        alert.informativeText = tr("Free and open source. Control a compatible HDMI TV with your Mac volume keys.\n\nOne external display · Apple silicon · macOS 14+\nCompatibility depends on the HDMI connection. This preview is not notarized.", "免费开源，用 Mac 音量键控制兼容的 HDMI 电视。\n\n单个外接屏幕 · Apple 芯片 · macOS 14+\n兼容性取决于 HDMI 连接。本预览包尚未公证。")
+        alert.messageText = "TV Volume Keys · " + AppVersion.full
+        alert.informativeText = tr("Free and open source. HDMI-CEC or an explicitly configured ADB connection.\n\nOne external HDMI display · Apple silicon · macOS 14+\nADB requires official Platform Tools and TV authorization.", "免费开源，支持 HDMI-CEC 或明确配置的 ADB 连接。\n\n单个外接 HDMI 屏幕 · Apple 芯片 · macOS 14+\nADB 需要官方 Platform Tools 和电视授权。")
         alert.addButton(withTitle: tr("Done", "完成"))
         alert.addButton(withTitle: tr("Licenses", "许可证"))
         if alert.runModal() == .alertSecondButtonReturn,
@@ -332,6 +229,7 @@ final class VolumeKeys: NSObject, NSApplicationDelegate {
     }
     @objc func quitApp() { NSApplication.shared.terminate(nil) }
     func applicationWillTerminate(_ note: Notification) {
+        ExecutableRunner.cancelAll()
         if let tap { CGEvent.tapEnable(tap: tap, enable: false); CFMachPortInvalidate(tap) }
     }
 }
@@ -353,10 +251,40 @@ if CommandLine.arguments.contains("--self-test") {
     check(!shouldCaptureVolume(enabled: true, cec: true, hdmi: true, modifiers: .maskCommand), "Command-volume stays native")
     check(!shouldCaptureVolume(enabled: true, cec: true, hdmi: true, modifiers: .maskControl), "Control-volume stays native")
     print("14 event-routing checks passed; no CEC commands sent")
+    try runTransportTests()
+} else if let index = CommandLine.arguments.firstIndex(of: "--configure-adb") {
+    guard index + 1 < CommandLine.arguments.count,
+          let pathIndex = CommandLine.arguments.firstIndex(of: "--adb-path"), pathIndex + 1 < CommandLine.arguments.count else {
+        fputs("Usage: --configure-adb PRIVATE_IP:PORT --adb-path /absolute/path/to/adb\n", stderr); exit(2)
+    }
+    do {
+        let config = try ADBTransport.configure(executable: CommandLine.arguments[pathIndex + 1], serial: CommandLine.arguments[index + 1])
+        try config.save(); UserDefaults.standard.set("adb", forKey: "controlTransport")
+        print("ADB connection verified and saved for this user. Quit and reopen the app to apply CLI configuration. No volume command sent.")
+    } catch { fputs(error.localizedDescription + "\n", stderr); exit(1) }
+} else if CommandLine.arguments.contains("--use-cec") {
+    UserDefaults.standard.set("cec", forKey: "controlTransport")
+    print("CEC selected. No volume command sent.")
+} else if let index = CommandLine.arguments.firstIndex(of: "--send") {
+    guard index + 1 < CommandLine.arguments.count, let action = VolumeAction(rawValue: CommandLine.arguments[index + 1]) else { exit(2) }
+    do {
+        guard defaultOutputIsTV() else { throw Failure.message("Select a single HDMI output first") }
+        if UserDefaults.standard.string(forKey: "controlTransport") == "adb" {
+            guard let config = ADBConfiguration.load() else { throw Failure.message("Configure ADB before sending") }
+            try ADBTransport(config).press(action)
+        } else { try CEC().press(action) }
+        print("Volume command completed.")
+    } catch { fputs(error.localizedDescription + "\n", stderr); exit(1) }
 } else if CommandLine.arguments.contains("--diagnose") {
     var status: [String: Any] = ["processAccessibilityTrusted": AXIsProcessTrusted(), "defaultOutputIsTV": defaultOutputIsTV(), "externalDisplayCount": externalDisplayCount()]
     do { let cec = try CEC(); status["cecAvailable"] = true; status["sourceAddress"] = cec.source }
     catch { status["cecAvailable"] = false; status["error"] = error.localizedDescription }
+    let selected = UserDefaults.standard.string(forKey: "controlTransport") ?? "cec"
+    status["selectedTransport"] = selected
+    if selected == "adb", let config = ADBConfiguration.load() {
+        do { try ADBTransport(config).probe(reconnect: false); status["adbAvailable"] = true }
+        catch { status["adbAvailable"] = false; status["adbError"] = error.localizedDescription }
+    }
     let data = try JSONSerialization.data(withJSONObject: status, options: [.prettyPrinted, .sortedKeys])
     print(String(decoding: data, as: UTF8.self))
 } else {

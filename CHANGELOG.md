@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.0-preview.1
+
+- Explicit ADB compatibility mode alongside the default HDMI-CEC path, with a local connection dialog and TV identity binding.
+- Faster supported Android media-volume adjustment; separate volume-mute key handling.
+- Verified live-transport targeting, bounded subprocesses, asynchronous connection checks and no queued volume retries.
+- Preserve single HDMI output, headphone/modifier pass-through and held-mute safeguards.
+- Split transport, configuration UI and shared routing for maintenance; add host checks for target validation, identity mismatch and timeouts.
+- Developer ID release signing support, source fingerprint metadata and updated setup/privacy documentation. Actual notarization and device acceptance are recorded separately in the release validation.
+
 ## 0.1.0-preview.1
 
 First experimental source and binary preview.
