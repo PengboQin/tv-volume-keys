@@ -104,7 +104,7 @@ def main():
             run(['codesign', '--sign', args.sign_identity, '--timestamp', dmg])
         shutil.rmtree(stage)
         sourcezip = DIST / f'TV-Volume-Keys-{VERSION}-source.zip'
-        include = run(['git', 'ls-files']).splitlines() if in_repo else ['Sources', 'scripts', 'Resources', 'docs', 'README.md', 'README.zh-CN.md', 'LICENSE', 'THIRD_PARTY_NOTICES.md', 'CHANGELOG.md', '.gitignore']
+        include = [p for p in run(['git', 'ls-files', '-z']).split('\0') if p] if in_repo else ['Sources', 'scripts', 'Resources', 'docs', 'README.md', 'README.zh-CN.md', 'LICENSE', 'THIRD_PARTY_NOTICES.md', 'CHANGELOG.md', '.gitignore']
         with zipfile.ZipFile(sourcezip, 'w', zipfile.ZIP_DEFLATED) as z:
             for item in include:
                 p = ROOT / item
