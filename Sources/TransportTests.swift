@@ -6,11 +6,11 @@ func runTransportTests() throws {
     }
     final class Fake: ADBCommandRunning {
         var identity = "0123456789abcdef"
-        var transportResult = CommandResult(status: 0, output: "9")
+        var transportResult = CommandResult(status: 0, output: "List of devices attached\nphone device transport_id:2\n192.168.1.50:5555 device product:demo transport_id:9\n")
         var calls: [[String]] = []
         func run(_ arguments: [String], timeout: TimeInterval) throws -> CommandResult {
             calls.append(arguments)
-            if arguments.last == "get-transport-id" { return transportResult }
+            if arguments == ["devices", "-l"] { return transportResult }
             if arguments.last == "android_id" { return CommandResult(status: 0, output: identity) }
             return CommandResult(status: 0, output: "")
         }
@@ -37,7 +37,7 @@ func runTransportTests() throws {
     do { try client.press(.down, outputCheck: { true }); throw Failure.message("Changed identity was accepted") }
     catch { try check(!fake.calls.contains { $0.contains("media_session") || $0.contains("input") }, "changed TV cannot receive controls") }
     fake.calls.removeAll(); fake.identity = "0123456789abcdef"
-    fake.transportResult = CommandResult(status: 1, output: "error: device unauthorized")
+    fake.transportResult = CommandResult(status: 0, output: "192.168.1.50:5555 unauthorized transport_id:9\n")
     do { try client.press(.down, outputCheck: { true }); throw Failure.message("Unauthorized TV was accepted") }
     catch {
         try check(error.localizedDescription.contains("debugging") || error.localizedDescription.contains("调试"), "actionable TV authorization error")

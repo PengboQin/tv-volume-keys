@@ -122,9 +122,23 @@ final class ADBTransport {
         return result.output
     }
     private func transportID() throws -> String {
-        let id = try checked(["-s", configuration.serial, "get-transport-id"])
-        guard !id.isEmpty, id.allSatisfy({ $0.isASCII && $0.isNumber }), UInt64(id) != nil else {
+        // Official adb exposes IDs in its local server inventory, not a get-transport-id command.
+        // This lists existing transports only; it does not scan or connect other network devices.
+        let inventory = try checked(["devices", "-l"])
+        let matches = inventory.split(whereSeparator: \.isNewline).map { $0.split(whereSeparator: \.isWhitespace) }
+            .filter { $0.first == Substring(configuration.serial) }
+        guard matches.count == 1, matches[0].count >= 2 else {
             throw Failure.message(tr("TV connection is not ready. Approve any debugging request on the TV", "电视连接未就绪；若有调试授权弹窗，请在电视上允许"))
+        }
+        if matches[0][1] == "unauthorized" {
+            throw Failure.message(tr("Allow this Mac's debugging request on the TV, then retry", "请在电视上允许这台 Mac 的调试请求，然后重试"))
+        }
+        guard matches[0][1] == "device", let field = matches[0].first(where: { $0.hasPrefix("transport_id:") }) else {
+            throw Failure.message(tr("The selected TV is offline", "选定的电视未连接"))
+        }
+        let id = String(field.dropFirst("transport_id:".count))
+        guard id.allSatisfy({ $0.isASCII && $0.isNumber }), let number = UInt64(id), number > 0 else {
+            throw Failure.message(tr("The selected TV has no valid transport", "选定电视的连接编号无效"))
         }
         return id
     }
