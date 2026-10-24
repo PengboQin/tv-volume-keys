@@ -1,5 +1,10 @@
 # Changelog
 
+## Documentation follow-up · 2026-10-23
+
+- Record successful M1 ADB physical-keyboard acceptance after installation.
+- Document recovery when a stale Accessibility entry remains enabled after a signing-identity change. Release artifacts and their original checksums are unchanged.
+
 ## 0.2.0-preview.1
 
 - Explicit ADB compatibility mode alongside the default HDMI-CEC path, with a local connection dialog and TV identity binding.

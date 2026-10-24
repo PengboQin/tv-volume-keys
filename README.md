@@ -42,6 +42,13 @@ Gatekeeper. Keep a working previous version until your own setup is verified.
    An update that changes signing identity may require user reauthorization.
 5. Use volume/mute keys; hold Fn if your keyboard uses standard function keys.
 
+If Accessibility appears enabled but the app still reports missing permission after
+an upgrade, remove its stale Accessibility entry and add the current **TV Volume
+Keys Preview.app** from Applications again. Enable that entry; do not reset other
+apps' permissions or disable system protection. This recovered the tested M1
+installation, whose physical keyboard control was then confirmed by the user.
+See the [installation and permission record](docs/M1安装与权限恢复.md).
+
 Menu buttons work through the same selected transport. Pause, Quit and optional
 Open at Login are included; installation does not silently enable a login item.
 Option/Command/Control media shortcuts pass through to macOS. Headphone output or
